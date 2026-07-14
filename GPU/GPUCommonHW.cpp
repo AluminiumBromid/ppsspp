@@ -1,3 +1,9 @@
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+
 #include "Common/Profiler/Profiler.h"
 
 #include "Common/GPU/thin3d.h"
@@ -36,6 +42,72 @@ struct CommandInfo {
 };
 
 static CommandInfo cmdInfo_[256];
+
+namespace {
+std::mutex g_geLogMutex;
+FILE *g_geLogFile = nullptr;
+u64 g_geLogFrameIndex = static_cast<u64>(-1);
+u32 g_geLogDrawIndex = 0;
+
+FILE *GetGeLogFile() {
+	if (g_geLogFile) {
+		return g_geLogFile;
+	}
+
+	const char *path = std::getenv("GEPATCH_LOG_FILE");
+	if (!path || !path[0]) {
+		return nullptr;
+	}
+
+	g_geLogFile = std::fopen(path, "a");
+	return g_geLogFile;
+}
+
+void LogGeDrawEvent() {
+	FILE *logFile = GetGeLogFile();
+	if (!logFile) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(g_geLogMutex);
+
+	const u64 frameIndex = gpuStats.totals.numFlips;
+	if (frameIndex != g_geLogFrameIndex) {
+		g_geLogFrameIndex = frameIndex;
+		g_geLogDrawIndex = 0;
+	}
+
+	const char *titleId = std::getenv("GEPATCH_TITLE_ID");
+	if (!titleId || !titleId[0]) {
+		titleId = "UNKNOWN";
+	}
+
+	const int scissorWidth = std::max(0, gstate.getScissorX2() - gstate.getScissorX1() + 1);
+	const int scissorHeight = std::max(0, gstate.getScissorY2() - gstate.getScissorY1() + 1);
+	const int viewportWidth = static_cast<int>(std::lround(std::fabs(gstate.getViewportXScale() * 2.0f)));
+	const int viewportHeight = static_cast<int>(std::lround(std::fabs(gstate.getViewportYScale() * 2.0f)));
+
+	std::fprintf(
+		logFile,
+		"{\"event\":\"draw\",\"title_id\":\"%s\",\"frame_index\":%llu,\"draw_index\":%u,"
+		"\"through_mode\":%s,\"framebuf_addr\":\"0x%08x\","
+		"\"texture_addrs\":[\"0x%08x\"],\"viewport\":{\"width\":%d,\"height\":%d},"
+		"\"scissor\":{\"width\":%d,\"height\":%d}}\n",
+		titleId,
+		static_cast<unsigned long long>(frameIndex),
+		g_geLogDrawIndex++,
+		gstate.isModeThrough() ? "true" : "false",
+		gstate.getFrameBufAddress(),
+		gstate.getTextureAddress(0),
+		viewportWidth,
+		viewportHeight,
+		scissorWidth,
+		scissorHeight
+	);
+
+	std::fflush(logFile);
+}
+}  // namespace
 
 const CommonCommandTableEntry commonCommandTable[] = {
 	// From Common. No flushing but definitely need execute.
@@ -920,6 +992,8 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	}
 
 	const u32 count = op & 0xFFFF;
+	LogGeDrawEvent();
+
 	// Must check this after SetRenderFrameBuffer so we know SKIPDRAW_NON_DISPLAYED_FB.
 	if (gstate_c.skipDrawReason & (SKIPDRAW_SKIPFRAME | SKIPDRAW_NON_DISPLAYED_FB)) {
 		// Rough estimate, not sure what's correct.
