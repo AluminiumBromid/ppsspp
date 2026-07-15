@@ -48,6 +48,8 @@ std::mutex g_geLogMutex;
 FILE *g_geLogFile = nullptr;
 u64 g_geLogFrameIndex = static_cast<u64>(-1);
 u32 g_geLogDrawIndex = 0;
+u64 g_geLogFrameCount = 0;     // number of distinct frame indices logged so far
+u64 g_geLogMaxFrames = 0;      // 0 = unlimited; set from GEPATCH_MAX_FRAMES
 
 FILE *GetGeLogFile() {
 	if (g_geLogFile) {
@@ -57,6 +59,15 @@ FILE *GetGeLogFile() {
 	const char *path = std::getenv("GEPATCH_LOG_FILE");
 	if (!path || !path[0]) {
 		return nullptr;
+	}
+
+	const char *maxFramesEnv = std::getenv("GEPATCH_MAX_FRAMES");
+	if (maxFramesEnv && maxFramesEnv[0]) {
+		char *end = nullptr;
+		long val = std::strtol(maxFramesEnv, &end, 10);
+		if (end != maxFramesEnv && val > 0) {
+			g_geLogMaxFrames = static_cast<u64>(val);
+		}
 	}
 
 	g_geLogFile = std::fopen(path, "a");
@@ -71,10 +82,20 @@ void LogGeDrawEvent() {
 
 	std::lock_guard<std::mutex> lock(g_geLogMutex);
 
+	// Stop logging once the frame cap is reached
+	if (g_geLogMaxFrames > 0 && g_geLogFrameCount >= g_geLogMaxFrames) {
+		return;
+	}
+
 	const u64 frameIndex = gpuStats.totals.numFlips;
 	if (frameIndex != g_geLogFrameIndex) {
 		g_geLogFrameIndex = frameIndex;
 		g_geLogDrawIndex = 0;
+		g_geLogFrameCount++;
+		// Check cap again after incrementing
+		if (g_geLogMaxFrames > 0 && g_geLogFrameCount > g_geLogMaxFrames) {
+			return;
+		}
 	}
 
 	const char *titleId = std::getenv("GEPATCH_TITLE_ID");
