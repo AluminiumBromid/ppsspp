@@ -1,6 +1,7 @@
 #include "ppsspp_config.h"
 
 #include <algorithm>  // std::remove
+#include <cstdio>
 
 #include "Common/Profiler/Profiler.h"
 
@@ -38,6 +39,40 @@
 #include "GPU/Debugger/Stepping.h"
 
 bool __KernelIsDispatchEnabled();
+
+#ifndef PPSSPP_GE_TRACE_EXPORT
+#define PPSSPP_GE_TRACE_EXPORT 0
+#endif
+
+#if PPSSPP_GE_TRACE_EXPORT
+static FILE *g_geTraceFile = nullptr;
+
+static void GETraceInit() {
+	if (g_geTraceFile) {
+		return;
+	}
+	g_geTraceFile = fopen("ppsspp_ge_trace.csv", "w");
+	if (g_geTraceFile) {
+		fputs("event,list_id,pc,cmd,data,arg0,arg1,arg2\n", g_geTraceFile);
+		fflush(g_geTraceFile);
+	}
+}
+
+static void GETraceEvent(const char *event, int list_id, u32 pc, u32 cmd, u32 data, u32 arg0, u32 arg1, u32 arg2) {
+	if (!g_geTraceFile) {
+		GETraceInit();
+	}
+	if (!g_geTraceFile) {
+		return;
+	}
+
+	fprintf(g_geTraceFile, "%s,%d,%08x,%02x,%06x,%08x,%08x,%08x\n",
+		event, list_id, pc, cmd & 0xFF, data & 0xFFFFFF, arg0, arg1, arg2);
+	fflush(g_geTraceFile);
+}
+#else
+static inline void GETraceEvent(const char *, int, u32, u32, u32, u32, u32, u32) {}
+#endif
 
 void GPUCommon::Flush() {
 	drawEngineCommon_->Flush();
@@ -643,6 +678,7 @@ bool GPUCommon::SlowRunLoop(DisplayList &list) {
 		recorder_.NotifyCommand(list.pc);
 		u32 op = Memory::ReadUnchecked_U32(list.pc);
 		u32 cmd = op >> 24;
+		GETraceEvent("cmd", list.id, list.pc, cmd, op & 0xFFFFFF, gstate.base, gstate_c.offsetAddr, gstate.vertType);
 
 		u32 diff = op ^ gstate.cmdmem[cmd];
 		PreExecuteOp(op, diff);
@@ -893,23 +929,28 @@ bool GPUCommon::ShouldSplitOverGe() const {
 
 void GPUCommon::Execute_OffsetAddr(u32 op, u32 diff) {
 	gstate_c.offsetAddr = op << 8;
+	GETraceEvent("state", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_OFFSETADDR, op & 0xFFFFFF, gstate.base, gstate_c.offsetAddr, 0);
 }
 
 void GPUCommon::Execute_Vaddr(u32 op, u32 diff) {
 	gstate_c.vertexAddr = gstate_c.getRelativeAddress(op & 0x00FFFFFF);
+	GETraceEvent("vaddr", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_VADDR, op & 0xFFFFFF, gstate_c.vertexAddr, 0, 0);
 }
 
 void GPUCommon::Execute_Iaddr(u32 op, u32 diff) {
 	gstate_c.indexAddr = gstate_c.getRelativeAddress(op & 0x00FFFFFF);
+	GETraceEvent("iaddr", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_IADDR, op & 0xFFFFFF, gstate_c.indexAddr, 0, 0);
 }
 
 void GPUCommon::Execute_Origin(u32 op, u32 diff) {
 	if (currentList)
 		gstate_c.offsetAddr = currentList->pc;
+	GETraceEvent("state", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_ORIGIN, op & 0xFFFFFF, gstate.base, gstate_c.offsetAddr, 0);
 }
 
 void GPUCommon::Execute_Jump(u32 op, u32 diff) {
 	const u32 target = gstate_c.getRelativeAddress(op & 0x00FFFFFC);
+	GETraceEvent("cf", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_JUMP, op & 0xFFFFFF, target, currentList ? currentList->stackptr : 0, 0);
 	if (!Memory::IsValidAddress(target)) {
 		ERROR_LOG(Log::G3D, "JUMP to illegal address %08x - ignoring! data=%06x", target, op & 0x00FFFFFF);
 		UpdateState(GPUSTATE_ERROR);
@@ -923,6 +964,7 @@ void GPUCommon::Execute_BJump(u32 op, u32 diff) {
 	if (!currentList->bboxResult) {
 		// bounding box jump.
 		const u32 target = gstate_c.getRelativeAddress(op & 0x00FFFFFC);
+		GETraceEvent("cf", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_BJUMP, op & 0xFFFFFF, target, currentList ? currentList->stackptr : 0, currentList ? currentList->bboxResult : 0);
 		gpuStats.perFrame.numBBOXJumps++;
 		if (Memory::IsValidAddress(target)) {
 			UpdatePC(currentList->pc, target - 4);
@@ -938,6 +980,7 @@ void GPUCommon::Execute_Call(u32 op, u32 diff) {
 	PROFILE_THIS_SCOPE("gpu_call");
 
 	const u32 target = gstate_c.getRelativeAddress(op & 0x00FFFFFC);
+	GETraceEvent("cf", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_CALL, op & 0xFFFFFF, target, currentList ? currentList->stackptr : 0, 0);
 	if (!Memory::IsValidAddress(target)) {
 		ERROR_LOG(Log::G3D, "CALL to illegal address %08x - ignoring! data=%06x", target, op & 0x00FFFFFF);
 		if (g_Config.bIgnoreBadMemAccess) {
@@ -984,6 +1027,7 @@ void GPUCommon::DoExecuteCall(u32 target) {
 void GPUCommon::Execute_Ret(u32 op, u32 diff) {
 	// Local variable for better codegen
 	DisplayList *currentList = this->currentList;
+	GETraceEvent("cf", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_RET, op & 0xFFFFFF, 0, currentList ? currentList->stackptr : 0, 0);
 	if (currentList->stackptr == 0) {
 		DEBUG_LOG(Log::G3D, "RET: Stack empty!");
 	} else {
@@ -1009,6 +1053,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 	}
 
 	const u32 prev = Memory::ReadUnchecked_U32(currentList->pc - 4);
+	GETraceEvent("end", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_END, op & 0xFFFFFF, prev >> 24, prev & 0xFFFFFF, 0);
 	UpdatePC(currentList->pc, currentList->pc);
 	// Count in a few extra cycles on END.
 	cyclesExecuted += 60;
@@ -1053,6 +1098,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 				// However, this is likely a bug in how GE signal interrupts are handled.
 				trigger = false;
 				currentList->signal = behaviour;
+				GETraceEvent("signal", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_SIGNAL, prev & 0xFFFFFF, behaviour, signal, enddata);
 				DEBUG_LOG(Log::G3D, "Signal with Sync. signal/end: %04x %04x", signal, enddata);
 				break;
 			case PSP_GE_SIGNAL_JUMP:
@@ -1078,6 +1124,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 					} else {
 						UpdatePC(currentList->pc, target);
 						currentList->pc = target;
+						GETraceEvent("signal", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_SIGNAL, prev & 0xFFFFFF, behaviour, signal, target);
 						DEBUG_LOG(Log::G3D, "Signal with Jump (%s). signal/end: %04x %04x", targetType, signal, enddata);
 					}
 				}
@@ -1112,6 +1159,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 						stackEntry.baseAddr = gstate.base;
 						UpdatePC(currentList->pc, target);
 						currentList->pc = target;
+						GETraceEvent("signal", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_SIGNAL, prev & 0xFFFFFF, behaviour, signal, target);
 						DEBUG_LOG(Log::G3D, "Signal with Call (%s). signal/end: %04x %04x", targetType, signal, enddata);
 					}
 				}
@@ -1129,6 +1177,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 						gstate.base = stackEntry.baseAddr;
 						UpdatePC(currentList->pc, stackEntry.pc);
 						currentList->pc = stackEntry.pc;
+						GETraceEvent("signal", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_SIGNAL, prev & 0xFFFFFF, behaviour, signal, enddata);
 						DEBUG_LOG(Log::G3D, "Signal with Return. signal/end: %04x %04x", signal, enddata);
 					}
 				}
@@ -1193,6 +1242,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 }
 
 void GPUCommon::Execute_BoundingBox(u32 op, u32 diff) {
+	GETraceEvent("draw", currentList ? currentList->id : -1, currentList ? currentList->pc : 0, GE_CMD_BOUNDINGBOX, op & 0xFFFFFF, op & 0xFFFF, gstate.vertType, gstate_c.skipDrawReason);
 	// Just resetting, nothing to check bounds for.
 	const u32 count = op & 0xFFFF;
 	if (count == 0) {
@@ -1700,10 +1750,12 @@ const GEState &GPUCommon::GetGState() {
 void GPUCommon::SetCmdValue(u32 op) {
 	u32 cmd = op >> 24;
 	u32 diff = op ^ gstate.cmdmem[cmd];
+	int listID = currentList ? currentList->id : -1;
 
 	Reporting::NotifyDebugger();
 	PreExecuteOp(op, diff);
 	gstate.cmdmem[cmd] = op;
+	GETraceEvent("cmd", listID, currentList ? currentList->pc : 0, cmd, op & 0xFFFFFF, gstate.base, gstate_c.offsetAddr, gstate.vertType);
 	ExecuteOp(op, diff);
 	downcount = 0;
 }
