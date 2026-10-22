@@ -126,7 +126,7 @@ void Recorder::DirtyDrawnVRAM() {
 }
 
 bool Recorder::BeginRecording() {
-	if (PSP_CoreParameter().fileType == IdentifiedFileType::PPSSPP_GE_DUMP) {
+	if (PSP_CoreParameter().fileType == IdentifiedFileType::PPSSPP_GE_DUMP && !allowDuringReplay) {
 		// Can't record a GE dump.
 		return false;
 	}

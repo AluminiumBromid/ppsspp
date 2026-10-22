@@ -39,6 +39,7 @@
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernelMemory.h"
+#include "Core/HLE/sceKernelThread.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
@@ -822,6 +823,189 @@ ReplayResult DumpExecute::Run() {
 	return ReplayResult::Done;
 }
 
+// Replays a raw frame capture from real hardware (vita-lab gecapture, CAPTURE_VERSION) with the recorder
+// active, which writes a normal GE dump of that frame. The capture holds RAM, VRAM and GE registers at
+// frame start plus the lists the game enqueued; see vita-lab docs/specs/gecapture.md.
+class CaptureExecute {
+public:
+	CaptureExecute(const std::vector<u8> &data, u32 stackStart, u32 stackEnd)
+		: data_(data), stackStart_(stackStart), stackEnd_(stackEnd) {
+	}
+
+	ReplayResult Run();
+
+private:
+#pragma pack(push, 1)
+	struct ListArgs {
+		u32 size, context, numStacks, stacks;
+	};
+	struct ListEntry {
+		u32 order, qid, list, stallAtEnqueue, stallFinal;
+		s32 cbid;
+		u32 head, hasArgs;
+		ListArgs args;
+	};
+	struct CaptureHeader {
+		u32 magic, version;
+		char gameID[16];
+		u32 ramStart, ramEnd;
+		u32 displayTopaddr, displayBufferwidth, displayPixelformat;
+		u32 numLists, flags, durationUs;
+		u32 reserved[8];
+	};
+#pragma pack(pop)
+	static_assert(sizeof(ListEntry) == 48, "capture list entry");
+	static_assert(sizeof(CaptureHeader) == 0x58, "capture header");
+
+	bool Parse();
+	void CopyRAM(u32 start, u32 end);
+	void RunList(u32 listPC);
+
+	const std::vector<u8> &data_;
+	u32 stackStart_;
+	u32 stackEnd_;
+
+	const CaptureHeader *header_ = nullptr;
+	const ListEntry *lists_ = nullptr;
+	const u32 *regs_ = nullptr;
+	const u8 *vram_ = nullptr;
+	const u8 *ram_ = nullptr;
+	u32 ramSize_ = 0;
+};
+
+// The run-dump code (WriteRunDumpCode) sits at the start of user memory, the root thread stack near
+// its end; the capture must not overwrite either. A small scratch list goes right after the code.
+static const u32 CAPTURE_PROTECT_SIZE = 0x100;
+static const u32 CAPTURE_SCRATCH_LIST = 0x80;
+
+bool CaptureExecute::Parse() {
+	const u8 *p = data_.data();
+	const u8 *end = p + data_.size();
+	u32 count = 0;
+	if (end - p < 4)
+		return false;
+	memcpy(&count, p, 4);
+	p += 4;
+	const u8 *parts[4]{};
+	u32 sizes[4]{};
+	for (u32 i = 0; i < count; ++i) {
+		u32 sz = 0;
+		if (end - p < 4)
+			return false;
+		memcpy(&sz, p, 4);
+		p += 4;
+		if ((u32)(end - p) < sz)
+			return false;
+		if (i < 4) {
+			parts[i] = p;
+			sizes[i] = sz;
+		}
+		p += sz;
+	}
+	if (count < 4 || sizes[0] < sizeof(CaptureHeader) || sizes[1] < 256 * 4 || sizes[2] != 2 * 1024 * 1024)
+		return false;
+
+	header_ = (const CaptureHeader *)parts[0];
+	if (header_->magic != CAPTURE_VERSION || header_->version != 1)
+		return false;
+	if (sizes[0] < sizeof(CaptureHeader) + header_->numLists * sizeof(ListEntry))
+		return false;
+	if (sizes[3] != header_->ramEnd - header_->ramStart)
+		return false;
+	lists_ = (const ListEntry *)(parts[0] + sizeof(CaptureHeader));
+	regs_ = (const u32 *)parts[1];
+	vram_ = parts[2];
+	ram_ = parts[3];
+	ramSize_ = sizes[3];
+	return true;
+}
+
+void CaptureExecute::CopyRAM(u32 start, u32 end) {
+	if (start >= end)
+		return;
+	Memory::MemcpyUnchecked(start, ram_ + (start - header_->ramStart), end - start);
+	NotifyMemInfo(MemBlockFlags::WRITE, start, end - start, "ReplayCapture");
+}
+
+void CaptureExecute::RunList(u32 listPC) {
+	u32 listID = ExecuteOnMain(Operation{ OpType::EnqueueList, listPC, 0 });
+	if ((int)listID < 0) {
+		ERROR_LOG(Log::GeDebugger, "Capture: enqueue of list %08x failed: %08x", listPC, listID);
+		return;
+	}
+	ExecuteOnMain(Operation{ OpType::ListSync, listID, 0 });
+}
+
+ReplayResult CaptureExecute::Run() {
+	if (!Parse()) {
+		ERROR_LOG(Log::GeDebugger, "Capture: invalid or truncated capture data");
+		return ReplayResult::Error;
+	}
+	NOTICE_LOG(Log::GeDebugger, "Capture: %.16s, %d lists, display %08x", header_->gameID, header_->numLists, header_->displayTopaddr);
+
+	if (gpu)
+		gpu->SetAddrTranslation(0x400);
+
+	// RAM: user memory only. Kernel memory holds PPSSPP's own HLE state, and the game's GE data is in
+	// user memory.
+	const u32 userBase = PSP_GetUserMemoryBase();
+	u32 start = std::max(header_->ramStart, userBase + CAPTURE_PROTECT_SIZE);
+	u32 end = std::min(header_->ramEnd, PSP_GetUserMemoryEnd());
+	if (stackStart_ > start && stackEnd_ <= end && stackStart_ < stackEnd_) {
+		CopyRAM(start, stackStart_);
+		CopyRAM(stackEnd_, end);
+		NOTICE_LOG(Log::GeDebugger, "Capture: RAM %08x-%08x restored, kept %08x-%08x and %08x-%08x (replay code and stack)",
+			start, end, userBase, userBase + CAPTURE_PROTECT_SIZE, stackStart_, stackEnd_);
+	} else {
+		CopyRAM(start, end);
+	}
+
+	Memory::MemcpyUnchecked(PSP_GetVidMemBase(), vram_, 2 * 1024 * 1024);
+	NotifyMemInfo(MemBlockFlags::WRITE, PSP_GetVidMemBase(), 2 * 1024 * 1024, "ReplayCapture");
+
+	// GE registers at frame start. Matrices are not in the capture (sceGeGetMtx reads zeros under
+	// Adrenaline); games normally upload them every frame.
+	memcpy(gstate.cmdmem, regs_, sizeof(gstate.cmdmem));
+	ExecuteOnMain(Operation{ OpType::ReapplyGfxState });
+
+	// The loaded CLUT is GE-internal state: load it again from the current CLUT registers.
+	const u32 scratch = userBase + CAPTURE_SCRATCH_LIST;
+	u32 pos = scratch;
+	if (gstate.cmdmem[GE_CMD_LOADCLUT] & 0x3F) {
+		Memory::Write_U32(gstate.cmdmem[GE_CMD_CLUTADDR], pos); pos += 4;
+		Memory::Write_U32(gstate.cmdmem[GE_CMD_CLUTADDRUPPER], pos); pos += 4;
+		Memory::Write_U32(gstate.cmdmem[GE_CMD_CLUTFORMAT], pos); pos += 4;
+		Memory::Write_U32(gstate.cmdmem[GE_CMD_LOADCLUT], pos); pos += 4;
+	}
+	Memory::Write_U32(GE_CMD_FINISH << 24, pos); pos += 4;
+	Memory::Write_U32(GE_CMD_END << 24, pos);
+	RunList(scratch);
+
+	// Record from here: the first display call starts the recording, the second one ends it.
+	gpu->GetRecorder()->SetAllowDuringReplay(true);
+	gpu->GetRecorder()->RecordNextFrame([](const Path &filename) {
+		NOTICE_LOG(Log::GeDebugger, "Capture: GE dump written to %s", filename.c_str());
+		printf("gecapture: wrote %s\n", filename.c_str());
+	});
+	__DisplaySetFramebuf(header_->displayTopaddr, header_->displayBufferwidth, header_->displayPixelformat, 0);
+
+	for (u32 i = 0; i < header_->numLists && !g_cancelled; ++i) {
+		const ListEntry &e = lists_[i];
+		if (e.stallFinal != 0 || e.head || (e.hasArgs && e.args.numStacks != 0)) {
+			WARN_LOG(Log::GeDebugger, "Capture: list %08x has stall %08x / head %d / %d stacks, replayed as a plain list",
+				e.list, e.stallFinal, e.head, e.hasArgs ? e.args.numStacks : 0);
+		}
+		if (e.list < userBase) {
+			WARN_LOG(Log::GeDebugger, "Capture: list %08x is in kernel memory, which is not restored", e.list);
+		}
+		RunList(e.list);
+	}
+
+	__DisplaySetFramebuf(header_->displayTopaddr, header_->displayBufferwidth, header_->displayPixelformat, 0);
+	gpu->GetRecorder()->SetAllowDuringReplay(false);
+	return ReplayResult::Done;
+}
+
 static bool ReadCompressed(u32 fp, void *dest, size_t sz, uint32_t version) {
 	u32 compressed_size = 0;
 	if (pspFileSystem.ReadFile(fp, (u8 *)&compressed_size, sizeof(compressed_size)) != sizeof(compressed_size)) {
@@ -856,6 +1040,27 @@ static u32 LoadReplay(const std::string &filename) {
 	pspFileSystem.ReadFile(fp, (u8 *)&header, sizeof(header));
 	u32 version = header.version;
 
+	if (memcmp(header.magic, HEADER_MAGIC, sizeof(header.magic)) == 0 && header.version == CAPTURE_VERSION) {
+		size_t gameIDLength = strnlen(header.gameID, sizeof(header.gameID));
+		if (gameIDLength != 0)
+			g_paramSFO.SetValue("DISC_ID", std::string(header.gameID, gameIDLength), (int)sizeof(header.gameID));
+		System_SetWindowTitle(g_paramSFO.GetValueString("DISC_ID") + " (GE frame capture)");
+
+		// Uncompressed parts, read as one block.
+		s64 total = pspFileSystem.SeekFile(fp, 0, FILEMOVE_END);
+		pspFileSystem.SeekFile(fp, sizeof(header), FILEMOVE_BEGIN);
+		lastExecCommands.clear();
+		lastExecPushbuf.resize((size_t)(total - sizeof(header)));
+		bool ok = pspFileSystem.ReadFile(fp, lastExecPushbuf.data(), lastExecPushbuf.size()) == lastExecPushbuf.size();
+		pspFileSystem.CloseFile(fp);
+		if (!ok) {
+			ERROR_LOG(Log::GeDebugger, "Truncated GE capture");
+			return 0;
+		}
+		lastExecFilename = filename;
+		lastExecVersion = header.version;
+		return header.version;
+	}
 	if (memcmp(header.magic, HEADER_MAGIC, sizeof(header.magic)) != 0 || header.version > VERSION || header.version < MIN_VERSION) {
 		ERROR_LOG(Log::GeDebugger, "Invalid GE dump or unsupported version");
 		pspFileSystem.CloseFile(fp);
@@ -963,7 +1168,7 @@ void WriteRunDumpCode(u32 codeStart) {
 // A long term goal is inversion of control here, but it's tricky for a number of reasons that you'll find
 // out if you try.
 ReplayResult RunMountedReplay(const std::string &filename) {
-	_assert_msg_(!gpu->GetRecorder()->IsActivePending(), "Cannot run replay while recording.");
+	_assert_msg_(lastExecVersion == CAPTURE_VERSION || !gpu->GetRecorder()->IsActivePending(), "Cannot run replay while recording.");
 
 	uint32_t version = lastExecVersion;
 	if (lastExecFilename != filename) {
@@ -988,10 +1193,18 @@ ReplayResult RunMountedReplay(const std::string &filename) {
 	if (!replayThread.joinable()) {
 		_dbg_assert_(g_opToExec.type == OpType::None);
 		g_opToExec = Operation{ OpType::None };
-		replayThread = std::thread([version]() {
+		const u32 stackStart = __KernelGetCurThreadStackStart();
+		const u32 stackEnd = __KernelGetCurThreadStack();
+		replayThread = std::thread([version, stackStart, stackEnd]() {
 			SetCurrentThreadName("Replay");
-			DumpExecute executor(lastExecPushbuf, lastExecCommands, version);
-			GPURecord::ReplayResult retval = executor.Run();
+			GPURecord::ReplayResult retval;
+			if (version == CAPTURE_VERSION) {
+				CaptureExecute executor(lastExecPushbuf, stackStart, stackEnd);
+				retval = executor.Run();
+			} else {
+				DumpExecute executor(lastExecPushbuf, lastExecCommands, version);
+				retval = executor.Run();
+			}
 			// Finish up
 			ExecuteOnMain(Operation{ OpType::Done });
 		});

@@ -191,7 +191,7 @@ bool DiscIDFromGEDumpPath(const Path &path, FileLoader *fileLoader, std::string 
 	Header header;
 	if (fileLoader->ReadAt(0, sizeof(header), &header) == sizeof(header)) {
 		const bool magicMatch = memcmp(header.magic, HEADER_MAGIC, sizeof(header.magic)) == 0;
-		if (magicMatch && header.version <= VERSION && header.version >= 4) {
+		if (magicMatch && ((header.version <= VERSION && header.version >= 4) || header.version == CAPTURE_VERSION)) {
 			size_t gameIDLength = strnlen(header.gameID, sizeof(header.gameID));
 			if (gameIDLength != 0) {
 				*id = std::string(header.gameID, gameIDLength);

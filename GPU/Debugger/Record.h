@@ -49,6 +49,10 @@ public:
 		return nextFrame || active;
 	}
 	bool RecordNextFrame(const std::function<void(const Path &)> callback);
+	// Allows recording while a GE dump file is the running "game" (used by the gecapture replay).
+	void SetAllowDuringReplay(bool allow) {
+		allowDuringReplay = allow;
+	}
 	void ClearCallback() {
 		// Not super thread safe..
 		writeCallback = nullptr;
@@ -90,6 +94,7 @@ private:
 	void EmitBezierSpline(u32 op);
 
 	bool active = false;
+	bool allowDuringReplay = false;
 	std::atomic<bool> nextFrame = false;
 	int flipLastAction = -1;
 	int flipFinishAt = -1;

@@ -37,6 +37,10 @@ static const char * const HEADER_MAGIC = "PPSSPPGE";
 // Version 6: Corrects dirty VRAM flag
 static const int VERSION = 6;
 static const int MIN_VERSION = 2;
+// Not a recording: a raw frame capture from real hardware (vita-lab gecapture), replayed and recorded
+// into a normal dump. After the header: u32 part count, then per part u32 size + data
+// (capture.bin, gestate.bin, vram_start.bin, ram.bin).
+static const uint32_t CAPTURE_VERSION = 0x50414347;  // "GCAP"
 
 enum class CommandType : u8 {
 	INIT = 0,

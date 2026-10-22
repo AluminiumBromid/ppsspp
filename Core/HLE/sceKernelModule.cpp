@@ -1874,7 +1874,8 @@ int __KernelGPUReplay() {
 		Core_Stop();
 	}
 
-	if (PSP_CoreParameter().headLess && !PSP_CoreParameter().startBreak) {
+	// Only once the replay is complete: a Break means the replay thread is waiting for the next operation.
+	if (PSP_CoreParameter().headLess && !PSP_CoreParameter().startBreak && result != GPURecord::ReplayResult::Break) {
 		PSPPointer<u8> topaddr;
 		u32 linesize = 512;
 		__DisplayGetFramebuf(&topaddr, &linesize, nullptr, 0);
